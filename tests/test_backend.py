@@ -46,9 +46,8 @@ def test_custom_headers():
     backend = tpuf_backend.Backend("fake_api_key", headers = {"foo": "bar"})
     assert backend.session.headers["foo"] == "bar"
 
-    ns = tpuf.Namespace('fake_namespace', headers = {"foo": "bar"})
+    ns = tpuf.Namespace("fake_namespace", api_key="fake_api_key", headers={"foo": "bar"})
     assert ns.backend.session.headers["foo"] == "bar"
-
 
 def test_backend_eq():
     backend = tpuf_backend.Backend("fake_api_key", headers = {"foo": "bar"})

@@ -1,17 +1,29 @@
-import sys
-import iso8601
+import asyncio
+from dataclasses import dataclass, field
 import json
+import sys
 from datetime import datetime
-from turbopuffer.error import APIError
-from turbopuffer.vectors import Cursor, VectorResult, VectorColumns, VectorRow, batch_iter
-from turbopuffer.backend import Backend
-from turbopuffer.query import VectorQuery, Filters, RankInput, ConsistencyDict
-from typing import Dict, List, Literal, Optional, Iterable, Union, overload
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union, overload
+
+import iso8601
+
 import turbopuffer as tpuf
+from turbopuffer.backend import Backend
+from turbopuffer.error import APIError
+from turbopuffer.query import ConsistencyDict, Filters, RankInput, VectorQuery
+from turbopuffer.vectors import (
+    Cursor,
+    VectorColumns,
+    VectorResult,
+    VectorRow,
+    batch_iter,
+)
 
-CmekDict = Dict[Literal['key_name'], str]
-EncryptionDict = Dict[Literal['cmek'], CmekDict]
+CmekDict = Dict[Literal["key_name"], str]
+EncryptionDict = Dict[Literal["cmek"], CmekDict]
 
+
+@dataclass(frozen=True)
 class FullTextSearchParams:
     """
     Used for configuring BM25 full-text indexing for a given attribute.
@@ -22,7 +34,13 @@ class FullTextSearchParams:
     remove_stopwords: bool
     case_sensitive: bool
 
-    def __init__(self, language: str, stemming: bool, remove_stopwords: bool, case_sensitive: bool):
+    def __init__(
+        self,
+        language: str,
+        stemming: bool,
+        remove_stopwords: bool,
+        case_sensitive: bool,
+    ):
         self.language = language
         self.stemming = stemming
         self.remove_stopwords = remove_stopwords
@@ -36,16 +54,23 @@ class FullTextSearchParams:
             "case_sensitive": self.case_sensitive,
         }
 
+
+@dataclass(frozen=True)
 class AttributeSchema:
     """
     The schema for a particular attribute within a namespace.
     """
 
-    type: str # one of: 'string', 'uint', '[]string', '[]uint'
+    type: str  # one of: 'string', 'uint', '[]string', '[]uint'
     filterable: bool
     full_text_search: Optional[FullTextSearchParams] = None
 
-    def __init__(self, type: str, filterable: bool, full_text_search: Optional[FullTextSearchParams] = None):
+    def __init__(
+        self,
+        type: str,
+        filterable: bool,
+        full_text_search: Optional[FullTextSearchParams] = None,
+    ):
         self.type = type
         self.filterable = filterable
         self.full_text_search = full_text_search
@@ -59,29 +84,33 @@ class AttributeSchema:
             result["full_text_search"] = self.full_text_search.as_dict()
         return result
 
+
 # Type alias for a namespace schema
 NamespaceSchema = Dict[str, AttributeSchema]
+
 
 def parse_namespace_schema(data: dict) -> NamespaceSchema:
     namespace_schema = {}
     for key, value in data.items():
-        fts_params = value.get('full_text_search')
+        fts_params = value.get("full_text_search")
         fts_instance = None
         if fts_params:
             fts_instance = FullTextSearchParams(
-                language=fts_params['language'],
-                stemming=fts_params['stemming'],
-                remove_stopwords=fts_params['remove_stopwords'],
-                case_sensitive=fts_params['case_sensitive']
+                language=fts_params["language"],
+                stemming=fts_params["stemming"],
+                remove_stopwords=fts_params["remove_stopwords"],
+                case_sensitive=fts_params["case_sensitive"],
             )
         attribute_schema = AttributeSchema(
-            type=value['type'],
-            filterable=value['filterable'],
-            full_text_search=fts_instance
+            type=value["type"],
+            filterable=value["filterable"],
+            full_text_search=fts_instance,
         )
         namespace_schema[key] = attribute_schema
     return namespace_schema
 
+
+@dataclass
 class Namespace:
     """
     The Namespace type represents a set of vectors stored in turbopuffer.
@@ -94,7 +123,9 @@ class Namespace:
 
     metadata: Optional[dict] = None
 
-    def __init__(self, name: str, api_key: Optional[str] = None, headers: Optional[dict] = None):
+    def __init__(
+        self, name: str, api_key: Optional[str] = None, headers: Optional[dict] = None
+    ):
         """
         Creates a new turbopuffer.Namespace object for querying the turbopuffer API.
 
@@ -106,7 +137,7 @@ class Namespace:
         self.backend = Backend(api_key, headers)
 
     def __str__(self) -> str:
-        return f'tpuf-namespace:{self.name}'
+        return f"tpuf-namespace:{self.name}"
 
     def __eq__(self, other):
         if isinstance(other, Namespace):
@@ -114,317 +145,509 @@ class Namespace:
         else:
             return False
 
-    def refresh_metadata(self):
-        response = self.backend.make_api_request('namespaces', self.name, method='HEAD')
-        status_code = response.get('status_code')
+    async def arefresh_metadata(self):
+        """
+        Asynchronous version of refresh_metadata
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, method="HEAD"
+        )
+        status_code = response.get("status_code")
         if status_code == 200:
-            headers = response.get('headers', dict())
-            dimensions = int(headers.get('x-turbopuffer-dimensions', '0'))
-            approx_count = int(headers.get('x-turbopuffer-approx-num-vectors', '0'))
+            headers = response.get("headers", dict())
+
+            # Record any metadata we got in the HEAD request.
             self.metadata = {
-                'exists': dimensions != 0,
-                'dimensions': dimensions,
-                'approx_count': approx_count,
-                'created_at': iso8601.parse_date(headers.get('x-turbopuffer-created-at')),
+                # This must be explicit since the API might return a 200 OK, but the embedding doesn't exist.
+                "exists": headers.get("X-Exists", "false").lower() == "true",
             }
-        elif status_code == 404:
-            self.metadata = {
-                'exists': False,
-                'dimensions': 0,
-                'approx_count': 0,
-                'created_at': None,
-            }
+
+            # Parse created_at if available
+            created_at_str = headers.get("X-Created-At")
+            if created_at_str:
+                try:
+                    self.metadata["created_at"] = iso8601.parse_date(created_at_str)
+                except (ValueError, TypeError):
+                    pass
+
+            # Parse dimensions and approx_count if available
+            dimensions_str = headers.get("X-Dimensions")
+            if dimensions_str:
+                try:
+                    self.metadata["dimensions"] = int(dimensions_str)
+                except (ValueError, TypeError):
+                    pass
+            approx_count_str = headers.get("X-Approx-Count")
+            if approx_count_str:
+                try:
+                    self.metadata["approx_count"] = int(approx_count_str)
+                except (ValueError, TypeError):
+                    pass
         else:
-            raise APIError(response.status_code, 'Unexpected status code', response.get('content'))
+            raise APIError(
+                response.get("status_code", 500),
+                "Unexpected status code",
+                str(response.get("content") or ""),
+            )
+
+    def refresh_metadata(self):
+        """
+        Refresh metadata from the API
+        """
+        return asyncio.run(self.arefresh_metadata())
+
+    async def aexists(self) -> bool:
+        """
+        Asynchronous version to check if the namespace exists
+        """
+        # Always refresh the exists check since metadata from namespaces() might be delayed.
+        await self.arefresh_metadata()
+        if self.metadata is None:
+            return False
+        return self.metadata["exists"]
 
     def exists(self) -> bool:
         """
-        Returns True if the namespace exists, and False if the namespace is missing or empty.
+        Check if the namespace exists
         """
-        # Always refresh the exists check since metadata from namespaces() might be delayed.
-        self.refresh_metadata()
-        return self.metadata['exists']
+        return asyncio.run(self.aexists())
+
+    async def adimensions(self) -> int:
+        """
+        Asynchronous version to get the dimensions of vectors in the namespace
+        """
+        if self.metadata is None or "dimensions" not in self.metadata:
+            await self.arefresh_metadata()
+        if self.metadata is None:
+            return 0
+        return self.metadata.get("dimensions", 0)
 
     def dimensions(self) -> int:
         """
-        Returns the number of vector dimensions stored in this namespace.
+        Get the dimensions of vectors in the namespace
         """
-        if self.metadata is None or 'dimensions' not in self.metadata:
-            self.refresh_metadata()
-        return self.metadata.pop('dimensions', 0)
+        return asyncio.run(self.adimensions())
+
+    async def aapprox_count(self) -> int:
+        """
+        Asynchronous version to get the approximate count of vectors in the namespace
+        """
+        if self.metadata is None or "approx_count" not in self.metadata:
+            await self.arefresh_metadata()
+        if self.metadata is None:
+            return 0
+        return self.metadata.get("approx_count", 0)
 
     def approx_count(self) -> int:
         """
-        Returns the approximate number of vectors stored in this namespace.
+        Get the approximate count of vectors in the namespace
         """
-        if self.metadata is None or 'approx_count' not in self.metadata:
-            self.refresh_metadata()
-        return self.metadata.pop('approx_count', 0)
+        return asyncio.run(self.aapprox_count())
+
+    async def acreated_at(self) -> Optional[datetime]:
+        """
+        Asynchronous version to get when the namespace was created
+        """
+        if self.metadata is None or "created_at" not in self.metadata:
+            await self.arefresh_metadata()
+        if self.metadata is None:
+            return None
+        return self.metadata.get("created_at", None)
 
     def created_at(self) -> Optional[datetime]:
         """
-        Returns the creation date of this namespace.
+        Get when the namespace was created
         """
-        if self.metadata is None or 'created_at' not in self.metadata:
-            self.refresh_metadata()
-        return self.metadata.pop('created_at', None)
+        return asyncio.run(self.acreated_at())
+
+    async def aschema(self) -> NamespaceSchema:
+        """
+        Asynchronous version to get the current schema for the namespace
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, "schema", method="GET"
+        )
+        return parse_namespace_schema(response["content"])
 
     def schema(self) -> NamespaceSchema:
         """
         Returns the current schema for the namespace.
         """
-        response = self.backend.make_api_request('namespaces', self.name, 'schema', method='GET')
+        return asyncio.run(self.aschema())
+
+    async def aupdate_schema(self, schema_updates: NamespaceSchema):
+        """
+        Asynchronous version to update the schema for the namespace
+        """
+        # Create a dictionary payload instead of encoding it as JSON bytes
+        schema_dict = {key: value.as_dict() for key, value in schema_updates.items()}
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, "schema", method="POST", payload=schema_dict
+        )
         return parse_namespace_schema(response["content"])
 
     def update_schema(self, schema_updates: NamespaceSchema):
         """
-        Writes updates to the schema for a namespace.
-        Returns the final schema after updates are done.
-
-        See https://turbopuffer.com/docs/schema for specifics on allowed updates.
+        Update the schema for the namespace.
+        This will add or modify attributes, but not remove them.
         """
-        request_payload = json.dumps({key: value.as_dict() for key, value in schema_updates.items()}).encode()
-        response = self.backend.make_api_request('namespaces', self.name, 'schema', method='POST', payload=request_payload)
-        return parse_namespace_schema(response["content"])
+        return asyncio.run(self.aupdate_schema(schema_updates))
+
+    async def acopy_from_namespace(self, source_namespace: str):
+        """
+        Asynchronous version to create a copy of another namespace
+        """
+        payload = {"copy_from_namespace": source_namespace}
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, payload=payload
+        )
+        assert response.get("content", dict()).get("status", "") == "OK", (
+            f"Invalid copy_from_namespace() response: {response}"
+        )
 
     def copy_from_namespace(self, source_namespace: str):
         """
-        Copies all documents from another namespace to this namespace.
-
-        See: https://turbopuffer.com/docs/upsert#parameters `copy_from_namespace`
-        for specifics on how this works.
+        Create a copy of another namespace. This will copy all vectors and the schema.
         """
-        payload = {
-            "copy_from_namespace": source_namespace
-        }
-        response = self.backend.make_api_request('namespaces', self.name, payload=payload)
-        assert response.get('content', dict()).get('status', '') == 'OK', f'Invalid copy_from_namespace() response: {response}'
+        return asyncio.run(self.acopy_from_namespace(source_namespace))
 
     @overload
-    def upsert(self,
-               ids: Union[List[int], List[str]],
-               vectors: List[List[float]],
-               attributes: Optional[Dict[str, List[Optional[Union[str, int]]]]] = None,
-               schema: Optional[Dict] = None,
-               distance_metric: Optional[str] = None,
-               encryption: Optional[EncryptionDict] = None) -> None:
-        """
-        Creates or updates multiple vectors provided in a column-oriented layout.
-        If this call succeeds, data is guaranteed to be durably written to object storage.
-
-        Upserting a vector will overwrite any existing vector with the same ID.
-        """
-        ...
+    async def aupsert(
+        self,
+        ids: Union[List[int], List[str]],
+        vectors: List[List[float]],
+        attributes: Optional[Dict[str, List[Optional[Union[str, int]]]]] = None,
+        schema: Optional[Dict] = None,
+        distance_metric: Optional[str] = None,
+        encryption: Optional[EncryptionDict] = None,
+    ) -> None: ...
 
     @overload
-    def upsert(self,
-               data: Union[dict, VectorColumns],
-               distance_metric: Optional[str] = None,
-               schema: Optional[Dict] = None,
-               encryption: Optional[EncryptionDict] = None) -> None:
-        """
-        Creates or updates multiple vectors provided in a column-oriented layout.
-        If this call succeeds, data is guaranteed to be durably written to object storage.
-
-        Upserting a vector will overwrite any existing vector with the same ID.
-        """
-        ...
+    async def aupsert(
+        self,
+        data: Union[dict, VectorColumns],
+        distance_metric: Optional[str] = None,
+        schema: Optional[Dict] = None,
+        encryption: Optional[EncryptionDict] = None,
+    ) -> None: ...
 
     @overload
-    def upsert(self,
-               data: Union[Iterable[dict], Iterable[VectorRow]],
-               distance_metric: Optional[str] = None,
-               schema: Optional[Dict] = None,
-               encryption: Optional[EncryptionDict] = None) -> None:
-        """
-        Creates or updates a multiple vectors provided as a list or iterator.
-        If this call succeeds, data is guaranteed to be durably written to object storage.
-
-        Upserting a vector will overwrite any existing vector with the same ID.
-        """
-        ...
+    async def aupsert(
+        self,
+        data: Union[Iterable[dict], Iterable[VectorRow]],
+        distance_metric: Optional[str] = None,
+        schema: Optional[Dict] = None,
+        encryption: Optional[EncryptionDict] = None,
+    ) -> None: ...
 
     @overload
-    def upsert(self,
-               data: VectorResult,
-               distance_metric: Optional[str] = None,
-               schema: Optional[Dict] = None,
-               encryption: Optional[EncryptionDict] = None) -> None:
-        """
-        Creates or updates multiple vectors.
-        If this call succeeds, data is guaranteed to be durably written to object storage.
+    async def aupsert(
+        self,
+        data: VectorResult,
+        distance_metric: Optional[str] = None,
+        schema: Optional[Dict] = None,
+        encryption: Optional[EncryptionDict] = None,
+    ) -> None: ...
 
-        Upserting a vector will overwrite any existing vector with the same ID.
+    async def aupsert(
+        self,
+        data=None,
+        ids=None,
+        vectors=None,
+        attributes=None,
+        schema=None,
+        distance_metric=None,
+        encryption=None,
+    ) -> None:
         """
-        ...
-
-    def upsert(self,
-               data=None,
-               ids=None,
-               vectors=None,
-               attributes=None,
-               schema=None,
-               distance_metric=None,
-               encryption= None) -> None:
-        if data is None:
-            if ids is not None and vectors is not None:
-                return self.upsert(VectorColumns(ids=ids, vectors=vectors, attributes=attributes), schema=schema, distance_metric=distance_metric, encryption=encryption)
-            else:
-                raise ValueError('upsert() requires both ids= and vectors= be set.')
-        elif (ids is not None and attributes is None) or (attributes is not None and schema is None):
+        Asynchronous version to insert or update vectors in the namespace
+        """
+        if data is None and ids is None:
+            raise ValueError(
+                "upsert() must take either data= or (ids=, vectors=) arguments"
+            )
+        elif (ids is None and vectors is not None) or (
+            vectors is None and ids is not None
+        ):
+            raise ValueError("upsert() with ids= must also have vectors=")
+        elif (ids is not None and attributes is None) or (
+            attributes is not None and schema is None
+        ):
             # Offset arguments to handle positional arguments case with no data field.
-            return self.upsert(VectorColumns(ids=data, vectors=ids, attributes=vectors), schema=attributes, distance_metric=distance_metric, encryption=encryption)
+            return await self.aupsert(
+                VectorColumns(ids=data, vectors=ids, attributes=vectors),
+                schema=attributes,
+                distance_metric=distance_metric,
+                encryption=encryption,
+            )
         elif isinstance(data, VectorColumns):
             # "if None in data.vectors:" is not supported because data.vectors might be a list of np.ndarray
             # None == pd.ndarray is an ambiguous comparison in this case.
-            for vec in data.vectors:
-                if vec is None:
-                    raise ValueError('upsert() call would result in a vector deletion, use Namespace.delete([ids...]) instead.')
 
-            payload = {**data.__dict__}
+            if len(data.vectors) > 0 and None in data.vectors:
+                raise ValueError("VectorColumns.vectors must not contain None values")
 
-            if distance_metric is not None:
+            payload = {
+                "ids": data.ids,
+                "vectors": data.vectors,
+            }
+            if data.attributes:
+                payload["attributes"] = data.attributes
+
+            if schema:
+                payload["schema"] = schema
+
+            if distance_metric:
                 payload["distance_metric"] = distance_metric
 
-            if schema is not None:
-                payload["schema"] = schema
-            
-            if encryption is not None:
+            if encryption:
                 payload["encryption"] = encryption
 
-            response = self.backend.make_api_request('namespaces', self.name, payload=payload)
+            response = await self.backend.amake_api_request(
+                "namespaces", self.name, payload=payload
+            )
 
-            assert response.get('content', dict()).get('status', '') == 'OK', f'Invalid upsert() response: {response}'
+            assert response.get("content", dict()).get("status", "") == "OK", (
+                f"Invalid upsert() response: {response}"
+            )
             self.metadata = None  # Invalidate cached metadata
-        elif isinstance(data, VectorRow):
-            raise ValueError('upsert() should be called on a list of vectors, got single vector.')
+
         elif isinstance(data, list):
             if isinstance(data[0], dict):
-                return self.upsert(VectorColumns.from_rows(data), schema=schema, distance_metric=distance_metric, encryption=encryption)
+                return await self.aupsert(
+                    VectorColumns.from_rows(data),
+                    schema=schema,
+                    distance_metric=distance_metric,
+                    encryption=encryption,
+                )
             elif isinstance(data[0], VectorRow):
-                return self.upsert(VectorColumns.from_rows(data), schema=schema, distance_metric=distance_metric, encryption=encryption)
+                return await self.aupsert(
+                    VectorColumns.from_rows(data),
+                    schema=schema,
+                    distance_metric=distance_metric,
+                    encryption=encryption,
+                )
             elif isinstance(data[0], VectorColumns):
                 for columns in data:
-                    self.upsert(columns, schema=schema, distance_metric=distance_metric, encryption=encryption)
+                    await self.aupsert(
+                        columns,
+                        schema=schema,
+                        distance_metric=distance_metric,
+                        encryption=encryption,
+                    )
                 return
             else:
-                raise ValueError(f'Unsupported list data type: {type(data[0])}')
-        elif isinstance(data, dict):
-            if 'id' in data:
-                raise ValueError('upsert() should be called on a list of vectors, got single vector.')
-            elif 'ids' in data:
-                return self.upsert(VectorColumns.from_dict(data), schema=data.get('schema', None), distance_metric=distance_metric, encryption=encryption)
-            else:
-                raise ValueError('Provided dict is missing ids.')
-        elif 'pandas' in sys.modules and isinstance(data, sys.modules['pandas'].DataFrame):
-            if 'id' not in data.keys():
-                raise ValueError('Provided pd.DataFrame is missing an id column.')
-            if 'vector' not in data.keys():
-                raise ValueError('Provided pd.DataFrame is missing a vector column.')
-            # start = time.monotonic()
-            for i in range(0, len(data), tpuf.upsert_batch_size):
-                batch = data[i:i+tpuf.upsert_batch_size]
-                attributes = dict()
-                for key, values in batch.items():
-                    if key != 'id' and key != 'vector':
-                        attributes[key] = values.tolist()
-                columns = tpuf.VectorColumns(
-                    ids=batch['id'].tolist(),
-                    vectors=batch['vector'].transform(lambda x: x.tolist()).tolist(),
-                    attributes=attributes
+                raise ValueError(
+                    f"upsert() list type must be of dict, VectorRow, or VectorColumns: {type(data[0])}"
                 )
-                # time_diff = time.monotonic() - start
-                # print(f"Batch {columns.ids[0]}..{columns.ids[-1]} begin:", time_diff, '/', len(batch), '=', len(batch)/time_diff)
-                # before = time.monotonic()
-                # print(columns)
-                self.upsert(columns, schema=schema, distance_metric=distance_metric, encryption=encryption)
-                # time_diff = time.monotonic() - before
-                # print(f"Batch {columns.ids[0]}..{columns.ids[-1]} time:", time_diff, '/', len(batch), '=', len(batch)/time_diff)
-                # start = time.monotonic()
-            return
-        elif isinstance(data, Iterable):
-            # start = time.monotonic()
-            for batch in batch_iter(data, tpuf.upsert_batch_size):
-                # time_diff = time.monotonic() - start
-                # print('Batch begin:', time_diff, '/', len(batch), '=', len(batch)/time_diff)
-                # before = time.monotonic()
-                self.upsert(batch, schema=schema, distance_metric=distance_metric, encryption=encryption)
-                # time_diff = time.monotonic() - before
-                # print('Batch time:', time_diff, '/', len(batch), '=', len(batch)/time_diff)
-                # start = time.monotonic()
-            return
+        elif isinstance(data, dict):
+            if "id" in data:
+                # Convert a dict to a VectorRow
+                if not "vector" in data:
+                    raise ValueError(
+                        "upsert() should be called on a list of vectors, got single vector."
+                    )
+            elif "ids" in data:
+                return await self.aupsert(
+                    VectorColumns.from_dict(data),
+                    schema=data.get("schema", None),
+                    distance_metric=distance_metric,
+                    encryption=encryption,
+                )
+            else:
+                raise ValueError("Provided dict is missing ids.")
+        elif "pandas" in sys.modules and isinstance(
+            data, sys.modules["pandas"].DataFrame
+        ):
+            cols = list(data.columns)
+            if "id" not in cols or "vector" not in cols:
+                missing = []
+                if "id" not in cols:
+                    missing.append("id")
+                if "vector" not in cols:
+                    missing.append("vector")
+                raise ValueError(
+                    f'DataFrame must have columns "id" and "vector", but it only contains: {cols}. Missing: {missing}'
+                )
+            # todo: optimize this to avoid copying the dataframe
+            return await self.aupsert(
+                VectorColumns.from_rows(
+                    [
+                        VectorRow(data.iloc[i]["id"], data.iloc[i]["vector"])
+                        for i in range(len(data.index))
+                    ]
+                ),
+                schema=schema,
+                distance_metric=distance_metric,
+                encryption=encryption,
+            )
         else:
-            raise ValueError(f'Unsupported data type: {type(data)}')
+            raise ValueError(f"upsert() input type is not supported: {type(data)}")
+
+    def upsert(
+        self,
+        data=None,
+        ids=None,
+        vectors=None,
+        attributes=None,
+        schema=None,
+        distance_metric=None,
+        encryption=None,
+    ) -> None:
+        """
+        Insert or update vectors in the namespace.
+        """
+        return asyncio.run(
+            self.aupsert(
+                data=data,
+                ids=ids,
+                vectors=vectors,
+                attributes=attributes,
+                schema=schema,
+                distance_metric=distance_metric,
+                encryption=encryption,
+            )
+        )
+
+    async def adelete(self, ids: Union[int, str, List[int], List[str]]) -> None:
+        """
+        Asynchronous version to delete vectors from the namespace
+        """
+        if isinstance(ids, int) or isinstance(ids, str):
+            response = await self.backend.amake_api_request(
+                "namespaces",
+                self.name,
+                payload={
+                    "ids": [ids],
+                    "vectors": [None],
+                },
+            )
+        elif isinstance(ids, list):
+            response = await self.backend.amake_api_request(
+                "namespaces",
+                self.name,
+                payload={
+                    "ids": ids,
+                    "vectors": [None] * len(ids),
+                },
+            )
+        else:
+            raise ValueError(f"Invalid type for ids: {type(ids)}")
+
+        assert response.get("content", dict()).get("status", "") == "OK", (
+            f"Invalid delete() response: {response}"
+        )
+        self.metadata = None  # Invalidate cached metadata
 
     def delete(self, ids: Union[int, str, List[int], List[str]]) -> None:
         """
-        Deletes vectors by id.
+        Delete vectors from the namespace by their IDs.
         """
+        return asyncio.run(self.adelete(ids))
 
-        if isinstance(ids, int) or isinstance(ids, str):
-            response = self.backend.make_api_request('namespaces', self.name, payload={
-                'ids': [ids],
-                'vectors': [None],
-            })
-        elif isinstance(ids, list):
-            response = self.backend.make_api_request('namespaces', self.name, payload={
-                'ids': ids,
-                'vectors': [None] * len(ids),
-            })
-        else:
-            raise ValueError(f'Unsupported ids type: {type(ids)}')
-
-        assert response.get('content', dict()).get('status', '') == 'OK', f'Invalid delete() response: {response}'
+    async def adelete_by_filter(self, filters: Filters) -> int:
+        """
+        Asynchronous version to delete vectors that match the filter
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, payload={"delete_by_filter": filters}
+        )
+        response_content = response.get("content", dict())
+        assert response_content.get("status", "") == "ok", (
+            f"Invalid delete_by_filter() response: {response}"
+        )
         self.metadata = None  # Invalidate cached metadata
+        return response_content.get("deleted_count", 0)
 
     def delete_by_filter(self, filters: Filters) -> int:
-        response = self.backend.make_api_request('namespaces', self.name, payload={
-            'delete_by_filter': filters
-        })
-        response_content = response.get('content', dict())
-        assert response_content.get('status', '') == 'OK', f'Invalid delete_by_filter() response: {response}'
-        self.metadata = None  # Invalidate cached metadata
-        return response_content.get('rows_affected')
-
-    @overload
-    def query(self,
-              vector: Optional[List[float]] = None,
-              distance_metric: Optional[str] = None,
-              top_k: int = 10,
-              include_vectors: bool = False,
-              include_attributes: Optional[Union[List[str], bool]] = None,
-              filters: Optional[Filters] = None,
-              rank_by: Optional[RankInput] = None,
-              consistency: Optional[ConsistencyDict] = None
-              ) -> VectorResult:
-        ...
-
-    @overload
-    def query(self, query_data: VectorQuery) -> VectorResult:
-        ...
-
-    @overload
-    def query(self, query_data: dict) -> VectorResult:
-        ...
-
-    def query(self,
-              query_data=None,
-              vector=None,
-              distance_metric=None,
-              top_k=None,
-              include_vectors=None,
-              include_attributes=None,
-              filters=None,
-              rank_by=None,
-              consistency=None) -> VectorResult:
         """
-        Searches vectors matching the search query.
-
-        See https://turbopuffer.com/docs/reference/query for query filter parameters.
+        Delete vectors that match the filter.
+        Returns the number of vectors deleted.
         """
+        return asyncio.run(self.adelete_by_filter(filters))
 
+    @overload
+    async def aquery(
+        self,
+        vector: Optional[List[float]] = None,
+        distance_metric: Optional[str] = None,
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_attributes: Optional[Union[List[str], bool]] = None,
+        filters: Optional[Filters] = None,
+        rank_by: Optional[RankInput] = None,
+        consistency: Optional[ConsistencyDict] = None,
+    ) -> VectorResult: ...
+
+    @overload
+    async def aquery(self, query_data: VectorQuery) -> VectorResult: ...
+
+    @overload
+    async def aquery(self, query_data: dict) -> VectorResult: ...
+
+    async def aquery(
+        self,
+        query_data=None,
+        vector=None,
+        distance_metric=None,
+        top_k=None,
+        include_vectors=None,
+        include_attributes=None,
+        filters=None,
+        rank_by=None,
+        consistency=None,
+    ) -> VectorResult:
+        """
+        Asynchronous version to query vectors in the namespace
+        """
         if query_data is None:
-            return self.query(VectorQuery(
+            return await self.aquery(
+                VectorQuery(
+                    vector=vector,
+                    distance_metric=distance_metric,
+                    top_k=top_k or 10,
+                    include_vectors=include_vectors
+                    if include_vectors is not None
+                    else False,
+                    include_attributes=include_attributes,
+                    filters=filters,
+                    rank_by=rank_by,
+                    consistency=consistency,
+                )
+            )
+        if not isinstance(query_data, VectorQuery):
+            if isinstance(query_data, dict):
+                query_data = VectorQuery.from_dict(query_data)
+            else:
+                raise ValueError(
+                    f"query() input type must be compatible with turbopuffer.VectorQuery: {type(query_data)}"
+                )
+
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, "query", payload=query_data.__dict__
+        )
+        result = VectorResult(response.get("content", dict()), namespace=self)
+        result.performance = response.get("performance")
+        return result
+
+    def query(
+        self,
+        query_data=None,
+        vector=None,
+        distance_metric=None,
+        top_k=None,
+        include_vectors=None,
+        include_attributes=None,
+        filters=None,
+        rank_by=None,
+        consistency=None,
+    ) -> VectorResult:
+        """
+        Query vectors in the namespace.
+        """
+        return asyncio.run(
+            self.aquery(
+                query_data=query_data,
                 vector=vector,
                 distance_metric=distance_metric,
                 top_k=top_k,
@@ -432,67 +655,87 @@ class Namespace:
                 include_attributes=include_attributes,
                 filters=filters,
                 rank_by=rank_by,
-                consistency=consistency
-            ))
-        if not isinstance(query_data, VectorQuery):
-            if isinstance(query_data, dict):
-                query_data = VectorQuery.from_dict(query_data)
-            else:
-                raise ValueError(f'query() input type must be compatible with turbopuffer.VectorQuery: {type(query_data)}')
+                consistency=consistency,
+            )
+        )
 
-        response = self.backend.make_api_request('namespaces', self.name, 'query', payload=query_data.__dict__)
-        result = VectorResult(response.get('content', dict()), namespace=self)
-        result.performance = response.get('performance')
+    async def avectors(self, cursor: Optional[Cursor] = None) -> VectorResult:
+        """
+        Asynchronous version to get all vectors in the namespace
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, query={"cursor": cursor}
+        )
+        content = response.get("content", dict())
+        next_cursor = content.pop("next_cursor", None)
+        result = VectorResult(content, namespace=self, next_cursor=next_cursor)
+        result.performance = response.get("performance")
         return result
 
     def vectors(self, cursor: Optional[Cursor] = None) -> VectorResult:
         """
-        This function exports the entire dataset at full precision.
-        A VectorResult is returned that will lazily load batches of vectors if treated as an Iterator.
-
-        If you want to look up vectors by ID, use the query function with an id filter.
+        Get all the vectors in the namespace.
         """
+        return asyncio.run(self.avectors(cursor))
 
-        response = self.backend.make_api_request('namespaces', self.name, query={'cursor': cursor})
-        content = response.get('content', dict())
-        next_cursor = content.pop('next_cursor', None)
-        result = VectorResult(content, namespace=self, next_cursor=next_cursor)
-        result.performance = response.get('performance')
-        return result
+    async def adelete_all_indexes(self) -> None:
+        """
+        Asynchronous version to delete all indexes in the namespace
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, "index", method="DELETE"
+        )
+        assert response.get("content", dict()).get("status", "") == "ok", (
+            f"Invalid delete_all_indexes() response: {response}"
+        )
 
     def delete_all_indexes(self) -> None:
         """
-        Deletes all indexes in a namespace.
+        Delete all indexes in the namespace.
         """
+        return asyncio.run(self.adelete_all_indexes())
 
-        response = self.backend.make_api_request('namespaces', self.name, 'index', method='DELETE')
-        assert response.get('content', dict()).get('status', '') == 'ok', f'Invalid delete_all_indexes() response: {response}'
+    async def adelete_all(self) -> None:
+        """
+        Asynchronous version to delete all vectors in the namespace
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces", self.name, method="DELETE"
+        )
+        assert response.get("content", dict()).get("status", "") == "ok", (
+            f"Invalid delete_all() response: {response}"
+        )
+        self.metadata = None  # Invalidate cached metadata
 
     def delete_all(self) -> None:
         """
-        Deletes all data as well as all indexes.
+        Delete all vectors in the namespace.
         """
+        return asyncio.run(self.adelete_all())
 
-        response = self.backend.make_api_request('namespaces', self.name, method='DELETE')
-        assert response.get('content', dict()).get('status', '') == 'ok', f'Invalid delete_all() response: {response}'
-        self.metadata = None  # Invalidate cached metadata
+    async def arecall(self, num=20, top_k=10) -> float:
+        """
+        Asynchronous version to test the recall of the namespace
+        """
+        response = await self.backend.amake_api_request(
+            "namespaces",
+            self.name,
+            "_debug",
+            "recall",
+            query={"num": num, "top_k": top_k},
+        )
+        content = response.get("content", dict())
+        assert "avg_recall" in content, f"Invalid recall() response: {response}"
+        return float(content.get("avg_recall"))
 
     def recall(self, num=20, top_k=10) -> float:
         """
-        This function evaluates the recall performance of ANN queries in this namespace.
-
-        When you call this function, it selects 'num' random vectors that were previously inserted.
-        For each of these vectors, it performs an ANN index search as well as a ground truth exhaustive search.
-
-        Recall is calculated as the ratio of matching vectors between the two search results.
+        Test the recall of the namespace using brute force search as ground truth.
         """
-
-        response = self.backend.make_api_request('namespaces', self.name, '_debug', 'recall', query={'num': num, 'top_k': top_k})
-        content = response.get('content', dict())
-        assert 'avg_recall' in content, f'Invalid recall() response: {response}'
-        return float(content.get('avg_recall'))
+        return asyncio.run(self.arecall(num, top_k))
 
 
+@dataclass
 class NamespaceIterator:
     """
     The VectorResult type represents a set of vectors that are the result of a query.
@@ -502,12 +745,17 @@ class NamespaceIterator:
     """
 
     backend: Backend
-    namespaces: List[Namespace] = []
+    namespaces: List[Namespace] = field(default_factory=list)
     index: int = -1
     offset: int = 0
     next_cursor: Optional[Cursor] = None
 
-    def __init__(self, backend: Backend, initial_set: Union[List[Namespace], List[dict]] = [], next_cursor: Optional[Cursor] = None):
+    def __init__(
+        self,
+        backend: Backend,
+        initial_set: Union[List[Namespace], List[dict]] = [],
+        next_cursor: Optional[Cursor] = None,
+    ):
         self.backend = backend
         self.index = -1
         self.offset = 0
@@ -517,14 +765,18 @@ class NamespaceIterator:
             if isinstance(initial_set[0], Namespace):
                 self.namespaces = initial_set
             else:
-                self.namespaces = NamespaceIterator.load_namespaces(backend.api_key, initial_set)
+                self.namespaces = NamespaceIterator.load_namespaces(
+                    backend.api_key, initial_set
+                )
 
-    def load_namespaces(api_key: Optional[str], initial_set: List[dict]) -> List[Namespace]:
+    def load_namespaces(
+        api_key: Optional[str], initial_set: List[dict]
+    ) -> List[Namespace]:
         output = []
         for input in initial_set:
-            ns = tpuf.Namespace(input['id'], api_key=api_key)
+            ns = tpuf.Namespace(input["id"], api_key=api_key)
             ns.metadata = {
-                'exists': True,
+                "exists": True,
             }
             output.append(ns)
 
@@ -535,10 +787,12 @@ class NamespaceIterator:
         if not self.next_cursor and self.offset == 0:
             return str(str_list)
         else:
-            return ("NamespaceIterator("
-                    f"offset={self.offset}, "
-                    f"next_cursor='{self.next_cursor}', "
-                    f"namespaces={str_list})")
+            return (
+                "NamespaceIterator("
+                f"offset={self.offset}, "
+                f"next_cursor='{self.next_cursor}', "
+                f"namespaces={str_list})"
+            )
 
     def __len__(self) -> int:
         assert self.offset == 0, "Can't call len(NamespaceIterator) after iterating"
@@ -562,7 +816,7 @@ class NamespaceIterator:
             self.next_cursor = None
         return self.namespaces[index]
 
-    def __iter__(self) -> 'NamespaceIterator':
+    def __iter__(self) -> "NamespaceIterator":
         assert self.offset == 0, "Can't iterate over NamespaceIterator multiple times"
         return NamespaceIterator(self.backend, self.namespaces, self.next_cursor)
 
@@ -574,24 +828,31 @@ class NamespaceIterator:
             raise StopIteration
         else:
             response = self.backend.make_api_request(
-                'namespaces',
-                query={'cursor': self.next_cursor}
+                "namespaces", query={"cursor": self.next_cursor}
             )
-            content = response.get('content', dict())
+            content = response.get("content", dict())
             self.offset += len(self.namespaces)
             self.index = -1
-            self.next_cursor = content.pop('next_cursor', None)
-            self.namespaces = NamespaceIterator.load_namespaces(self.backend.api_key, content.pop('namespaces', list()))
+            self.next_cursor = content.pop("next_cursor", None)
+            self.namespaces = NamespaceIterator.load_namespaces(
+                self.backend.api_key, content.pop("namespaces", list())
+            )
             return self.__next__()
+
+
+async def anamespaces(api_key: Optional[str] = None) -> Iterable[Namespace]:
+    """
+    Asynchronous version of namespaces() that returns an iterator of all namespaces.
+    """
+    backend = Backend(api_key)
+    response = await backend.amake_api_request("namespaces")
+    content = response.get("content", dict())
+    next_cursor = content.pop("next_cursor", None)
+    return NamespaceIterator(backend, content.pop("namespaces", list()), next_cursor)
 
 
 def namespaces(api_key: Optional[str] = None) -> Iterable[Namespace]:
     """
-    Lists all turbopuffer namespaces for a given api_key.
-    If no api_key is provided, the globally configured API key will be used.
+    Returns an iterator of all namespaces.
     """
-    backend = Backend(api_key)
-    response = backend.make_api_request('namespaces')
-    content = response.get('content', dict())
-    next_cursor = content.pop('next_cursor', None)
-    return NamespaceIterator(backend, content.pop('namespaces', list()), next_cursor)
+    return asyncio.run(anamespaces(api_key))
